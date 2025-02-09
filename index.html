@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SPH 기반 행성 충돌 시뮬레이션 (Fragmentation 개선)</title>
+  <style>
+    /* Reset 및 기본 스타일 */
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background-color: #121212; font-family: sans-serif; color: #fff; }
+    /* 좌측 행성 메뉴 (태양계 행성들) */
+    #left-menu {
+      position: absolute; top: 0; left: 0; width: 200px; height: 100vh;
+      background-color: #1e1e1e; border-right: 1px solid #333; overflow-y: auto; padding: 10px; z-index: 10;
+    }
+    #left-menu ul { list-style: none; }
+    #left-menu li {
+      padding: 8px 10px; margin-bottom: 8px; background-color: #2a2a2a; border-radius: 4px; cursor: pointer;
+      transition: background-color 0.2s;
+    }
+    #left-menu li:hover { background-color: #3a3a3a; }
+    /* 우측 상단 버튼들 (아이콘만 표시) */
+    #top-right-buttons {
+      position: absolute; top: 10px; right: 10px; z-index: 20; display: flex; gap: 10px;
+    }
+    #top-right-buttons button {
+      background: none; border: none; cursor: pointer; padding: 6px; transition: opacity 0.2s;
+    }
+    #top-right-buttons button:focus { outline: none; }
+    /* 캔버스 */
+    #simulation-canvas { position: absolute; top: 0; left: 0; z-index: 5; }
+  </style>
+</head>
+<body>
+  <!-- 좌측 메뉴: 태양계 행성 선택 -->
+  <div id="left-menu">
+    <ul>
+      <li data-planet="mercury">Mercury</li>
+      <li data-planet="venus">Venus</li>
+      <li data-planet="earth">Earth</li>
+      <li data-planet="mars">Mars</li>
+      <li data-planet="jupiter">Jupiter</li>
+      <li data-planet="saturn">Saturn</li>
+      <li data-planet="uranus">Uranus</li>
+      <li data-planet="neptune">Neptune</li>
+    </ul>
+  </div>
+  <!-- 우측 상단 버튼들 -->
+  <div id="top-right-buttons">
+    <button id="grid-toggle" title="그리드 토글"></button>
+    <button id="start-stop" title="시작/정지"></button>
+  </div>
+  <!-- 메인 시뮬레이션 캔버스 -->
+  <canvas id="simulation-canvas"></canvas>
+
+  <script>
+    /* ===============================
+       전역 변수 및 캔버스 설정
+       =============================== */
+    const canvas = document.getElementById("simulation-canvas");
+    const ctx = canvas.getContext("2d");
+    function resizeCanvas() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // 그리드 표시 여부 및 미리보기 관련 변수
+    let gridOn = false;
+    let currentPreviewPlanet = null;
+    let isDragging = false;
+    let dragStart = { x: 0, y: 0 };
+    let dragVector = { x: 0, y: 0 };
+    let previewPosition = { x: 0, y: 0 };
+
+    // 행성 고유 ID (각 행성에 부여)
+    let planetCounter = 0;
+
+    /* ===============================
+       태양계 행성 구성 정보
+       =============================== */
+    const planetConfigs = {
+      mercury: { radius: 20, coreRatio: 0.5, particleCount: 200 },
+      venus:   { radius: 30, coreRatio: 0.3, particleCount: 300 },
+      earth:   { radius: 30, coreRatio: 0.3, particleCount: 300 },
+      mars:    { radius: 25, coreRatio: 0.3, particleCount: 250 },
+      jupiter: { radius: 60, coreRatio: 0.1, particleCount: 500 },
+      saturn:  { radius: 55, coreRatio: 0.1, particleCount: 500 },
+      uranus:  { radius: 40, coreRatio: 0.2, particleCount: 400 },
+      neptune: { radius: 40, coreRatio: 0.2, particleCount: 400 }
+    };
+
+    /* ===============================
+       행성 입자 생성 함수
+       - 초기 속도, 행성 ID, 결속력(cohesion), 내부 에너지 및 손상 초기화
+       =============================== */
+    function generatePlanetParticles(x, y, config, initialV, planetId) {
+      let particles = [];
+      const total = config.particleCount;
+      const planetRadius = config.radius;
+      const coreParticleCount = Math.floor(total * config.coreRatio);
+      const coreRadius = planetRadius * config.coreRatio;
+      const minDist = 4; // 입자간 최소 간격 (픽셀 단위)
+      for (let i = 0; i < total; i++) {
+        let attempts = 0, placed = false, px = x, py = y;
+        while (!placed && attempts < 10) {
+          const angle = Math.random() * 2 * Math.PI;
+          let r = (i < coreParticleCount)
+                  ? Math.random() * coreRadius
+                  : coreRadius + Math.random() * (planetRadius - coreRadius);
+          px = x + r * Math.cos(angle);
+          py = y + r * Math.sin(angle);
+          let tooClose = false;
+          for (const p of particles) {
+            const dx = p.x - px, dy = p.y - py;
+            if (Math.sqrt(dx * dx + dy * dy) < minDist) { tooClose = true; break; }
+          }
+          if (!tooClose) placed = true;
+          attempts++;
+        }
+        particles.push({
+          x: px, y: py,
+          vx: initialV.vx, vy: initialV.vy,
+          mass: 1,
+          radius: 2,
+          color: (i < coreParticleCount) ? "#FF4500" : "#B0C4DE",
+          planetId: planetId,
+          damage: 0,           // 충격에 따른 누적 손상
+          internalEnergy: 0,   // 내부 에너지 (충격파 효과)
+          cohesion: 0.2        // 낮은 결속력: 입자들이 쉽게 분리됨
+        });
+      }
+      return particles;
+    }
+
+    /* ===============================
+       SPH 시뮬레이션 클래스
+       - 중력, repulsion, 점성 및 충격파 효과/손상 누적 적용
+       =============================== */
+    class SPHSimulation {
+      constructor() {
+        this.particles = [];
+        this.running = false;
+        this.G = 0.2;  // 중력 상수
+        this.dt = 0.1; // 시간 간격
+      }
+      addPlanet(x, y, planetType, initialV) {
+        const config = planetConfigs[planetType];
+        if (!config) return;
+        planetCounter++;
+        const newParticles = generatePlanetParticles(x, y, config, initialV, planetCounter);
+        this.particles.push(...newParticles);
+      }
+      update(dt) {
+        const particles = this.particles;
+        // 각 입자 쌍에 대해 상호작용 계산
+        for (let i = 0; i < particles.length; i++) {
+          const p = particles[i];
+          let ax = 0, ay = 0;
+          // 충격파로 인한 순간 속도 변화 임시 변수
+          let impulseX = 0, impulseY = 0;
+
+          for (let j = 0; j < particles.length; j++) {
+            if (i === j) continue;
+            const p2 = particles[j];
+            const epsilon = 1.0;
+            const dx = p2.x - p.x, dy = p2.y - p.y;
+            const distSq = dx * dx + dy * dy + epsilon * epsilon;
+            const dist = Math.sqrt(distSq);
+            // 행성 간 상호작용: 다른 행성이면 중력 계수 2.0, 단 파편은 중력 효과 감소
+            const planetFactor = (p.planetId !== p2.planetId) ? 2.0 : 1.0;
+            let effectiveGravity = planetFactor * this.G;
+            if (p.planetId === 0) { effectiveGravity *= 0.2; } // 파편은 중력 영향 약화
+            const force = effectiveGravity * p2.mass / distSq;
+            ax += force * dx / dist;
+            ay += force * dy / dist;
+
+            // repulsion (충돌 방지 및 압력 모사)
+            const minDist = p.radius + p2.radius + 1;
+            if (dist < minDist && dist > 0) {
+              const repulse = (minDist - dist) * 0.2;
+              ax -= repulse * dx / dist;
+              ay -= repulse * dy / dist;
+            }
+            // 점성 효과: 가까운 입자간 상대 속도 완화
+            if (dist < 20 && dist > 0) {
+              const viscCoefficient = 0.05;
+              ax += viscCoefficient * (p2.vx - p.vx);
+              ay += viscCoefficient * (p2.vy - p.vy);
+            }
+
+            // 충격파 효과 및 손상 누적
+            const relV = Math.sqrt((p.vx - p2.vx) ** 2 + (p.vy - p2.vy) ** 2);
+            const shockThreshold = 3; // 낮은 임계값으로 충격 감지
+            if (relV > shockThreshold) {
+              // 낮은 결속력일수록 손상이 크게 누적됨
+              const energyIncrement = (relV - shockThreshold) * dt / (p.cohesion + 0.001);
+              p.internalEnergy += energyIncrement;
+              p.damage += energyIncrement;
+              // 임시 impulse 변수에만 추가
+              const impulseFactor = 0.1;
+              const dirX = dx / (dist || 1), dirY = dy / (dist || 1);
+              impulseX += dirX * impulseFactor;
+              impulseY += dirY * impulseFactor;
+            }
+          }
+          // 가속도 -> 속도 반영
+          p.vx += ax * dt;
+          p.vy += ay * dt;
+          // 충격파 임시 변수 누적치도 속도에 반영
+          p.vx += impulseX;
+          p.vy += impulseY;
+        }
+
+        // 입자 위치 업데이트 및 속도 감쇠 (에너지 소산)
+        for (let i = 0; i < particles.length; i++) {
+          const p = particles[i];
+          p.x += p.vx * dt;
+          p.y += p.vy * dt;
+          p.vx *= 0.99;
+          p.vy *= 0.99;
+          // 내부 에너지 감쇠 (냉각 효과)
+          p.internalEnergy *= 0.98;
+
+          // ★ 추가된 부분: 화면 경계 충돌 처리 ★
+          // 좌우 경계
+          if (p.x < p.radius) {
+            p.x = p.radius;
+            p.vx *= -0.9; // 약간의 에너지 손실을 가정한 반사
+          } else if (p.x > canvas.width - p.radius) {
+            p.x = canvas.width - p.radius;
+            p.vx *= -0.9;
+          }
+          // 상하 경계
+          if (p.y < p.radius) {
+            p.y = p.radius;
+            p.vy *= -0.9;
+          } else if (p.y > canvas.height - p.radius) {
+            p.y = canvas.height - p.radius;
+            p.vy *= -0.9;
+          }
+        }
+
+        // 파손 처리: 누적 손상과 내부 에너지가 임계치를 넘으면 입자 결속 해제
+        for (let i = 0; i < particles.length; i++) {
+          const p = particles[i];
+          const breakThreshold = 10; // 낮은 임계치
+          if ((p.damage + p.internalEnergy) > breakThreshold && p.planetId !== 0) {
+            p.planetId = 0;      // 파편으로 전환
+            p.color = "#333";    // 파편 색상 (진한 회색)
+            p.mass *= 0.7;       // 질량 손실
+          }
+          // 매우 빠른 입자: 추가 질량 손실 및 색상 변화 (가스/먼지 효과)
+          const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+          if (speed > 8) {
+            p.mass *= 0.99;
+            p.color = "#777";
+          }
+        }
+      }
+      render(ctx) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (gridOn) { drawGrid(ctx); }
+        for (const p of this.particles) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+          ctx.fillStyle = p.color;
+          ctx.fill();
+        }
+        // 미리보기: 선택된 행성이 있을 경우 반투명 원 표시 (드래그 중이 아닐 때)
+        if (currentPreviewPlanet && !isDragging) {
+          const config = planetConfigs[currentPreviewPlanet];
+          ctx.beginPath();
+          ctx.arc(previewPosition.x, previewPosition.y, config.radius, 0, Math.PI * 2);
+          ctx.fillStyle = "rgba(200,200,200,0.3)";
+          ctx.fill();
+        }
+        // 드래그 중이면 초기 속도(방향) 표시: dragStart부터 dragVector까지 화살표 그리기
+        if (isDragging) {
+          ctx.beginPath();
+          ctx.moveTo(dragStart.x, dragStart.y);
+          ctx.lineTo(dragStart.x + dragVector.x, dragStart.y + dragVector.y);
+          ctx.strokeStyle = "rgba(255,255,255,0.8)";
+          ctx.lineWidth = 2;
+          ctx.stroke();
+          // 화살촉 그리기
+          const angle = Math.atan2(dragVector.y, dragVector.x);
+          const arrowLen = 10;
+          ctx.beginPath();
+          ctx.moveTo(dragStart.x + dragVector.x, dragStart.y + dragVector.y);
+          ctx.lineTo(dragStart.x + dragVector.x - arrowLen * Math.cos(angle - Math.PI/6),
+                     dragStart.y + dragVector.y - arrowLen * Math.sin(angle - Math.PI/6));
+          ctx.lineTo(dragStart.x + dragVector.x - arrowLen * Math.cos(angle + Math.PI/6),
+                     dragStart.y + dragVector.y - arrowLen * Math.sin(angle + Math.PI/6));
+          ctx.lineTo(dragStart.x + dragVector.x, dragStart.y + dragVector.y);
+          ctx.fillStyle = "rgba(255,255,255,0.8)";
+          ctx.fill();
+        }
+      }
+    }
+
+    /* ===============================
+       그리드 그리기 함수 (격자 간격: 50px)
+       =============================== */
+    function drawGrid(ctx) {
+      const spacing = 50;
+      ctx.strokeStyle = "rgba(255,255,255,0.1)";
+      ctx.lineWidth = 1;
+      for (let x = 0; x < canvas.width; x += spacing) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+        ctx.stroke();
+      }
+      for (let y = 0; y < canvas.height; y += spacing) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(canvas.width, y);
+        ctx.stroke();
+      }
+    }
+
+    /* ===============================
+       전역 시뮬레이션 인스턴스 생성
+       =============================== */
+    const simulation = new SPHSimulation();
+
+    /* ===============================
+       메인 루프: 업데이트 및 렌더링
+       =============================== */
+    function mainLoop() {
+      if (simulation.running) { simulation.update(simulation.dt); }
+      simulation.render(ctx);
+      requestAnimationFrame(mainLoop);
+    }
+    requestAnimationFrame(mainLoop);
+
+    /* ===============================
+       캔버스 이벤트: 드래그로 초기 속도 및 방향 설정
+       =============================== */
+    canvas.addEventListener("mousemove", function(e) {
+      const rect = canvas.getBoundingClientRect();
+      previewPosition.x = e.clientX - rect.left;
+      previewPosition.y = e.clientY - rect.top;
+      if (isDragging) {
+        dragVector.x = previewPosition.x - dragStart.x;
+        dragVector.y = previewPosition.y - dragStart.y;
+      }
+    });
+    canvas.addEventListener("mousedown", function(e) {
+      if (currentPreviewPlanet) {
+        const rect = canvas.getBoundingClientRect();
+        dragStart.x = e.clientX - rect.left;
+        dragStart.y = e.clientY - rect.top;
+        isDragging = true;
+      }
+    });
+    canvas.addEventListener("mouseup", function(e) {
+      if (isDragging && currentPreviewPlanet) {
+        const rect = canvas.getBoundingClientRect();
+        const initialSpeedScale = 0.05;
+        const velocity = {
+          vx: dragVector.x * initialSpeedScale,
+          vy: dragVector.y * initialSpeedScale
+        };
+        let spawnX = dragStart.x, spawnY = dragStart.y;
+        if (gridOn && e.ctrlKey) {
+          const spacing = 50;
+          spawnX = Math.round(spawnX / spacing) * spacing;
+          spawnY = Math.round(spawnY / spacing) * spacing;
+        }
+        simulation.addPlanet(spawnX, spawnY, currentPreviewPlanet, velocity);
+        currentPreviewPlanet = null;
+        isDragging = false;
+        dragVector.x = 0; dragVector.y = 0;
+      }
+    });
+
+    /* ===============================
+       좌측 메뉴: 행성 선택 시 미리보기 활성화
+       =============================== */
+    document.querySelectorAll("#left-menu li").forEach(function(li) {
+      li.addEventListener("click", function() {
+        currentPreviewPlanet = li.getAttribute("data-planet");
+      });
+    });
+
+    /* ===============================
+       우측 상단 버튼 이벤트: 시작/정지, 그리드 토글
+       =============================== */
+    const startStopBtn = document.getElementById("start-stop");
+    const gridToggleBtn = document.getElementById("grid-toggle");
+    const leftMenu = document.getElementById("left-menu");
+
+    const startIconSVG = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>`;
+    const stopIconSVG  = `<svg width="24" height="24" viewBox="0 0 24 24" fill="white"><rect x="6" y="6" width="12" height="12"></rect></svg>`;
+    const gridIconSVG  = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>`;
+
+    startStopBtn.innerHTML = startIconSVG;
+    gridToggleBtn.innerHTML = gridIconSVG;
+    gridToggleBtn.style.opacity = gridOn ? "1" : "0.5";
+
+    startStopBtn.addEventListener("click", function() {
+      if (simulation.running) {
+        simulation.running = false;
+        startStopBtn.innerHTML = startIconSVG;
+        leftMenu.style.display = "block";
+      } else {
+        simulation.running = true;
+        leftMenu.style.display = "none";
+        startStopBtn.innerHTML = stopIconSVG;
+      }
+    });
+
+    gridToggleBtn.addEventListener("click", function() {
+      gridOn = !gridOn;
+      gridToggleBtn.style.opacity = gridOn ? "1" : "0.5";
+    });
+  </script>
+</body>
+</html>
